@@ -1,0 +1,233 @@
+import os
+import sys
+import asyncio
+import httpx # Usaremos httpx para las peticiones HTTP
+
+# Para FastAPI
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+
+# Para cargar variables de entorno las credenciales
+from dotenv import load_dotenv
+
+# --- Configuración Inicial ---
+import google.generativeai as genai
+from langchain_community.embeddings import SentenceTransformerEmbeddings
+from langchain_community.vectorstores import Chroma
+
+# Cargar las variables del archivo .env al inicio del script
+load_dotenv()
+
+# Configuración de Google Gemini API Key
+google_api_key_env_name = "googgle api key"
+google_api_key_value = os.getenv(google_api_key_env_name)
+
+if google_api_key_value:
+    genai.configure(api_key=google_api_key_value)
+    print(f"INFO: Clave API de Google Gemini encontrada y configurada desde '{google_api_key_env_name}'.")
+else:
+    print(f"ERROR CRÍTICO: No se encontró la clave API de Google Gemini en la variable de entorno '{google_api_key_env_name}'.")
+    sys.exit("Clave API de Google Gemini no configurada. Por favor, configúrala.")
+
+# Configuración de la Base de Conocimiento Local
+CHROMA_DB_PATH = "ubicación de la info en vectores"
+embeddings_model = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+
+# Cargar la base de datos vectorial persistida
+try:
+    vectorstore = Chroma(persist_directory=CHROMA_DB_PATH, embedding_function=embeddings_model)
+    print(f"INFO: Base de datos vectorial cargada desde '{CHROMA_DB_PATH}'.")
+except Exception as e:
+    print(f"ERROR: No se pudo cargar la base de datos vectorial. Asegúrate de haberla creado con 'prepare_kb.py'. Error: {e}")
+    sys.exit("No se pudo cargar la base de datos vectorial.")
+
+# Inicializar el modelo de Gemini una vez
+gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+
+# --- TU FUNCIÓN `generate_response` ---
+def generate_response(messages_list):
+    """
+    Genera una respuesta del modelo de lenguaje de Google Gemini,
+    aumentada con información de la base de conocimiento local.
+    """
+    user_query = messages_list[-1]["content"] # Último mensaje del usuario
+
+    # 1. Recuperar información relevante de la base de conocimiento (RAG)
+    retrieved_docs = vectorstore.similarity_search(user_query, k=3)
+
+    context_text = ""
+    if retrieved_docs:
+        context_text = "\n\nInformación de contexto de la empresa:\n"
+        for i, doc in enumerate(retrieved_docs):
+            context_text += f"Documento {i+1}:\n{doc.page_content}\n---\n"
+        print(f"INFO: Documentos recuperados:\n{context_text[:200]}...")
+
+    # 2. Preparar el prompt para el LLM con el contexto recuperado
+    system_prompt = (
+        "Eres un asesor virtual útil, empático y directo de Kambista Empresas. "
+        "Responde SIEMPRE con mensajes breves y claros. "
+        "Procesa la información de contexto y responde a la pregunta del usuario con conocimiento. Sé inteligente"
+        "NO saludes al usuario, a menos que sea el primer mensaje de la conversación. "
+        "Si ya saludaste antes, NO vuelvas a saludar ni uses frases como 'Hola', 'Buenos días', etc. "
+        "Ve directo al grano y responde solo lo necesario. "
+        "No uses frases como 'Soy un modelo de lenguaje' o 'Soy un asistente virtual'. "
+        "Si la respuesta no se encuentra en el contexto, indica amablemente que será derivado a un asesor especializado. "
+        "Si das pasos, usa una lista numerada."
+        "No uses palabras como 'intentaré' o 'haré lo posible'. "
+        "No repitas información ni hagas respuestas largas."
+        "Haz que parezca una conversación fluida y natural, pero siempre breve y sin saludos repetidos."
+        
+    )
+    
+    gemini_conversation_history = []
+    
+    # Preparamos el contenido del primer turno, incluyendo system_prompt y context_text.
+    initial_user_content = system_prompt + context_text + "\n\n" + messages_list[0]["content"]
+
+    # Añadimos el primer mensaje del usuario (con el contexto y system_prompt fusionados)
+    gemini_conversation_history.append({"role": "user", "parts": [initial_user_content]})
+
+    # Añadimos el resto de los mensajes del historial de la conversación
+    for i in range(1, len(messages_list)):
+        msg = messages_list[i]
+        role_for_gemini = "model" if msg["role"] == "assistant" else "user"
+        gemini_conversation_history.append({"role": role_for_gemini, "parts": [msg["content"]]})
+
+
+    try:
+        print("\nINFO: Intentando llamar a la API de Google Gemini con contexto...")
+        response = gemini_model.generate_content(
+            contents=gemini_conversation_history,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=1024
+            )
+        )
+        print("INFO: Llamada a la API de Gemini exitosa.")
+        return response
+    except Exception as e:
+        print(f"OCURRIÓ UN ERROR AL LLAMAR A LA API DE GOOGLE GEMINI: {e}")
+        return None
+# --- Configuración de la API de Infobip ---
+INFOBIP_API_KEY = os.getenv("INFOBIP_API_KEY") #El api de infobip
+INFOBIP_BASE_URL = "3xmmn.api.infobip.com" 
+INFOBIP_SENDER_NUMBER = os.getenv("INFOBIP_SENDER_NUMBER") # El número de Kambista que usamos en Infobip
+                                                        
+                                                            
+
+
+if not INFOBIP_API_KEY:
+    print("ERROR CRÍTICO: INFOBIP_API_KEY no está configurada en tus variables de entorno o archivo .env")
+    sys.exit("API Key de Infobip no configurada. Por favor, configúrala.")
+if not INFOBIP_SENDER_NUMBER:
+    print("ERROR CRÍTICO: INFOBIP_SENDER_NUMBER no está configurado en tus variables de entorno o archivo .env")
+    sys.exit("Número de remitente de Infobip no configurado. Por favor, configúralo.")
+
+
+# --- Inicializar FastAPI ---
+app = FastAPI()
+
+# --- Endpoint para el Webhook de Infobip ---
+@app.post("/infobip-webhook")
+async def infobip_webhook(request: Request):
+    try:
+        data = await request.json()
+        print(f"Webhook de Infobip recibido: {data}")
+
+        user_number = None
+        user_text = None
+
+        # --- Extracción del mensaje de WhatsApp de Infobip ---
+        if "results" in data and len(data["results"]) > 0:
+            message_info = data["results"][0]
+            
+            # El número del remitente para WhatsApp de Infobip está en 'sender'
+            user_number = message_info.get("sender") 
+            
+            # El contenido del mensaje de texto para WhatsApp de Infobip está anidado en 'content'
+            if "content" in message_info and len(message_info["content"]) > 0:
+                for content_item in message_info["content"]:
+                    if content_item.get("type") == "TEXT":
+                        user_text = content_item.get("text")
+                        break # Ya encontramos el texto, salimos del bucle
+        # --- FIN de la Extracción ---
+
+        if not user_number or not user_text:
+            raise ValueError("No se pudo extraer el número de usuario o el texto del mensaje del webhook de Infobip.")
+
+        print(f"Mensaje de {user_number}: {user_text}")
+
+        # 2. Llamar al Chatbot de IA
+        # Para un historial persistente, necesitarías una base de datos.
+        messages_for_gemini = [{"role": "user", "content": user_text}] # Solo el mensaje actual por simplicidad
+
+        ai_response_obj = generate_response(messages_for_gemini)
+        
+        assistant_reply_content = ""
+        if ai_response_obj and hasattr(ai_response_obj, 'text'):
+            assistant_reply_content = ai_response_obj.text
+        else:
+            print("Advertencia: No se pudo obtener la respuesta de texto del modelo de IA.")
+            assistant_reply_content = "Lo siento, tuve un problema al generar una respuesta. Por favor, intenta de nuevo."
+            if ai_response_obj and hasattr(ai_response_obj, 'candidates') and ai_response_obj.candidates:
+                for candidate in ai_response_obj.candidates:
+                    if hasattr(candidate, 'finish_reason'):
+                        print(f"  Finish Reason: {candidate.finish_reason}")
+                    if hasattr(candidate, 'safety_ratings'):
+                        print(f"  Safety Ratings: {candidate.safety_ratings}")
+
+        print(f"Respuesta del Asistente AI: {assistant_reply_content}")
+
+        # 3. Enviar la respuesta de vuelta usando la API de Infobip (VÍA WHATSAPP)
+        await send_infobip_message(user_number, assistant_reply_content)
+
+        return JSONResponse(content={"status": "success", "message": "Mensaje procesado"}, status_code=200)
+    except Exception as e:
+        print(f"Error procesando webhook de Infobip: {e}")
+        # En caso de error, siempre es buena práctica devolver un 200 OK a Infobip
+        # para que no reintente enviar el mismo webhook repetidamente.
+        return JSONResponse(content={"status": "error", "message": str(e)}, status_code=200)
+
+# --- Función para enviar mensajes a través de la API de Infobip (Corregida para WhatsApp) ---
+# ...existing code...
+async def send_infobip_message(to_number: str, message_text: str):
+    url = f"https://{INFOBIP_BASE_URL}/whatsapp/1/message/text"
+    headers = {
+        "Authorization": f"App {INFOBIP_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    print(f"DEBUG: INFOBIP_SENDER_NUMBER usado para el campo 'from': {INFOBIP_SENDER_NUMBER}")
+    payload = {
+        "from": INFOBIP_SENDER_NUMBER,
+        "to": to_number,
+        "content": {
+            "text": message_text
+        }
+        # Puedes agregar aquí "callbackData" y "notifyUrl" si lo necesitas
+    }
+
+    print(f"Intentando enviar mensaje de WhatsApp a Infobip a {to_number} desde {INFOBIP_SENDER_NUMBER}...")
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            print(f"Mensaje de WhatsApp enviado a Infobip: {response.json()}")
+    except httpx.HTTPStatusError as e:
+        print(f"Error HTTP al enviar WhatsApp a Infobip: {e.response.status_code} - {e.response.text}")
+        raise
+    except httpx.RequestError as e:
+        print(f"Error de red al enviar WhatsApp a Infobip: {e}")
+        raise
+    except Exception as e:
+        print(f"Error desconocido al enviar WhatsApp a Infobip: {e}")
+        raise
+# ...existing code...
+
+# --- Ejecución del Servidor FastAPI ---
+if __name__ == "__main__":
+    import uvicorn
+    # Asegúrate de que tus variables INFOBIP_API_KEY y INFOBIP_SENDER_NUMBER están en tu .env
+    # La parte para ejecutar el servidor.
+    # El puerto 8000 es el estándar para Uvicorn/FastAPI.
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+    print("\nServidor FastAPI iniciado. Escuchando en el puerto 8000.")
